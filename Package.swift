@@ -4,11 +4,12 @@ import PackageDescription
 let package = Package(
     name: "MySSH",
     platforms: [
-        .iOS(.v17), // 必须是 iOS 17，匹配 Citadel 的最低要求
+        .iOS(.v17), 
         .macOS(.v14)
     ],
     products: [
-        .library(
+        // 这里必须是 executable，否则不会生成可执行二进制文件
+        .executable(
             name: "MySSH",
             targets: ["MySSH"]
         )
@@ -17,7 +18,8 @@ let package = Package(
         .package(url: "https://github.com/orlandos-nl/Citadel.git", from: "0.7.0")
     ],
     targets: [
-        .target(
+        // 这里必须是 executableTarget
+        .executableTarget(
             name: "MySSH",
             dependencies: [
                 .product(name: "Citadel", package: "Citadel")
