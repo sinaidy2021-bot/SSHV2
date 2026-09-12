@@ -1,0 +1,38 @@
+name: 自动构建 iOS IPA
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: 拉取源码
+        uses: actions/checkout@v4
+
+      - name: 选择 Xcode 版本
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+
+      - name: 编译并打包应用
+        run: |
+          # 1. 编译 iOS 架构二进制
+          swift build -c release --triple arm64-apple-ios16.0
+
+          # 2. 组装 Payload 文件夹结构
+          mkdir -p build/Payload/MySSH.app
+          cp .build/arm64-apple-ios16.0/release/MySSH build/Payload/MySSH.app/
+          cp Sources/MySSH/Info.plist build/Payload/MySSH.app/
+
+          # 3. 压制为标准 .ipa 文件
+          cd build
+          zip -r MySSH.ipa Payload
+          cd ..
+
+      - name: 上传 IPA 成品
+        uses: actions/upload-artifact@v4
+        with:
+          name: MySSH-IPA
+          path: build/MySSH.ipa
