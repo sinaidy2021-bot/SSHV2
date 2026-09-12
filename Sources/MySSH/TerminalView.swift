@@ -41,7 +41,8 @@ struct TerminalView: View {
                     .padding(12)
                 }
                 .background(Color(UIColor.systemBackground))
-                .onChange(of: session.blocks.count) { _ in
+                // 修复 4：适配 iOS 17 最新的 onChange 语法
+                .onChange(of: session.blocks.count) { oldValue, newValue in
                     if let lastID = session.blocks.last?.id {
                         withAnimation { proxy.scrollTo(lastID, anchor: .bottom) }
                     }
