@@ -83,9 +83,10 @@ class SSHSession: ObservableObject {
     private func startKeepAlive() {
         stopKeepAlive()
         keepAliveTimer = Timer.scheduledTimer(withTimeInterval: 20.0, repeats: true) { [weak self] _ in
+            // 修复 Swift 并发检查：在 MainActor 上下文中安全地展开弱引用并执行异步任务
             Task { @MainActor in
-                guard let self = self, self.isConnected else { return }
-                _ = try? await self.client?.executeCommand("echo -n ''")
+                guard let strongSelf = self, strongSelf.isConnected else { return }
+                _ = try? await strongSelf.client?.executeCommand("echo -n ''")
             }
         }
     }
