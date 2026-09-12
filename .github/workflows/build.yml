@@ -23,7 +23,6 @@ jobs:
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           echo "SDK 路径: $SDK_PATH" | tee logs/build.log
 
-          # 关键修改：统一目标架构为 arm64-apple-ios17.0
           swift build -c release \
             --triple arm64-apple-ios17.0 \
             -Xswiftc -sdk -Xswiftc "$SDK_PATH" \
@@ -31,12 +30,29 @@ jobs:
             -Xcc -target -Xcc arm64-apple-ios17.0 \
             2>&1 | tee -a logs/build.log
 
-          echo "正在组装 Payload 目录结构..." | tee -a logs/build.log
-          mkdir -p build/Payload/MySSH.app
-          cp .build/arm64-apple-ios17.0/release/MySSH build/Payload/MySSH.app/ 2>&1 | tee -a logs/build.log
-          cp Sources/MySSH/Info.plist build/Payload/MySSH.app/ 2>&1 | tee -a logs/build.log
+          echo "=== 正在定位编译生成的二进制文件 ===" | tee -a logs/build.log
+          # 自动全局搜索刚才链接成功的 MySSH 二进制执行文件，避免写死路径
+          BIN_PATH=$(find .build -type f -perm +111 -name "MySSH" | grep -v "\.build/checkouts" | head -n 1)
+          
+          if [ -z "$BIN_PATH" ]; then
+            BIN_PATH=$(find .build -type f -name "MySSH" | grep -v "\.build/checkouts" | head -n 1)
+          fi
 
-          echo "正在压制打包 MySSH.ipa..." | tee -a logs/build.log
+          echo "找到可执行文件路径: $BIN_PATH" | tee -a logs/build.log
+
+          if [ ! -f "$BIN_PATH" ]; then
+            echo "未找到二进制文件，输出 .build 目录结构以供排查：" | tee -a logs/build.log
+            find .build -maxdepth 4 >> logs/build.log
+            exit 1
+          fi
+
+          echo "=== 正在组装 Payload 目录结构 ===" | tee -a logs/build.log
+          mkdir -p build/Payload/MySSH.app
+          cp "$BIN_PATH" build/Payload/MySSH.app/MySSH 2>&1 | tee -a logs/build.log
+          cp Sources/MySSH/Info.plist build/Payload/MySSH.app/ 2>&1 | tee -a logs/build.log
+          chmod +x build/Payload/MySSH.app/MySSH
+
+          echo "=== 正在压制打包 MySSH.ipa ===" | tee -a logs/build.log
           cd build
           zip -r MySSH.ipa Payload 2>&1 | tee -a ../logs/build.log
           cd ..
