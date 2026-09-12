@@ -14,28 +14,26 @@ jobs:
       - name: 初始化日志环境
         run: |
           mkdir -p logs
-          echo "=== 编译环境信息 ===" > logs/env_info.log
-          xcodebuild -version >> logs/env_info.log 2>&1
+          xcodebuild -version > logs/env_info.log 2>&1
           xcrun --sdk iphoneos --show-sdk-path >> logs/env_info.log 2>&1
 
       - name: 编译并打包应用
-        id: build_step
         run: |
           set -o pipefail
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "使用的 iOS SDK 路径: $SDK_PATH" | tee logs/build.log
+          echo "SDK 路径: $SDK_PATH" | tee logs/build.log
 
-          # 执行编译并捕获所有输出到 logs/build.log
+          # 关键修改：统一目标架构为 arm64-apple-ios17.0
           swift build -c release \
-            --triple arm64-apple-ios16.0 \
+            --triple arm64-apple-ios17.0 \
             -Xswiftc -sdk -Xswiftc "$SDK_PATH" \
             -Xcc -isysroot -Xcc "$SDK_PATH" \
-            -Xcc -target -Xcc arm64-apple-ios16.0 \
+            -Xcc -target -Xcc arm64-apple-ios17.0 \
             2>&1 | tee -a logs/build.log
 
           echo "正在组装 Payload 目录结构..." | tee -a logs/build.log
           mkdir -p build/Payload/MySSH.app
-          cp .build/arm64-apple-ios16.0/release/MySSH build/Payload/MySSH.app/ 2>&1 | tee -a logs/build.log
+          cp .build/arm64-apple-ios17.0/release/MySSH build/Payload/MySSH.app/ 2>&1 | tee -a logs/build.log
           cp Sources/MySSH/Info.plist build/Payload/MySSH.app/ 2>&1 | tee -a logs/build.log
 
           echo "正在压制打包 MySSH.ipa..." | tee -a logs/build.log
@@ -48,18 +46,9 @@ jobs:
         run: |
           echo "==================== 【核心错误日志开始】 ===================="
           if [ -f logs/build.log ]; then
-            # 抓取包含 error: 的行以及前后关联上下文
-            grep -B 2 -A 4 -E "(error:|fatalError:)" logs/build.log | tail -n 50 || tail -n 40 logs/build.log
-          else
-            echo "未找到 build.log 文件！"
+            tail -n 60 logs/build.log
           fi
           echo "==================== 【核心错误日志结束】 ===================="
-
-          # 同时将错误直接渲染到 GitHub 页面顶部的 Summary 看板上（方便手机端直接查看）
-          echo "## ❌ 编译失败 - 关键报错捕获" >> $GITHUB_STEP_SUMMARY
-          echo '```text' >> $GITHUB_STEP_SUMMARY
-          grep -B 2 -A 4 -E "(error:|fatalError:)" logs/build.log | tail -n 40 >> $GITHUB_STEP_SUMMARY \vert{}\vert{} tail -n 30 logs/build.log >>$GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: 成功时上传 IPA 成品
         if: success()
