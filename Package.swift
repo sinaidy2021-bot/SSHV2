@@ -4,7 +4,8 @@ import PackageDescription
 let package = Package(
     name: "MySSH",
     platforms: [
-        .iOS(.v16)
+        .iOS(.v16),
+        .macOS(.v14) // 明确指定 macOS 14，解决 Citadel 依赖版本冲突
     ],
     products: [
         .library(
@@ -21,7 +22,8 @@ let package = Package(
             dependencies: [
                 .product(name: "Citadel", package: "Citadel")
             ],
-            path: "Sources/MySSH"
+            path: "Sources/MySSH",
+            exclude: ["Info.plist"] // 排除 Info.plist 避免编译器解析警告
         )
     ]
 )
