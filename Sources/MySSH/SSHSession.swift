@@ -9,7 +9,6 @@ class SSHSession: ObservableObject {
     @Published var statusMessage: String = "未连接"
     
     private var client: SSHClient?
-    // 抛弃容易引发并发隔离冲突的 Timer，改用原生的并发 Task
     private var keepAliveTask: Task<Void, Never>?
 
     func connect(server: SSHServer) {
@@ -77,23 +76,25 @@ class SSHSession: ObservableObject {
         }
     }
 
+    // 补齐此前缺失的 sendRaw 方法
+    func sendRaw(text: String) {
+        guard isConnected, let client = self.client else { return }
+        Task { @MainActor in
+            _ = try? await client.executeCommand(text)
+        }
+    }
+
     private func appendNotice(_ msg: String) {
         blocks.append(CommandBlock(command: "系统消息", output: msg, isRunning: false))
     }
 
     private func startKeepAlive() {
         stopKeepAlive()
-        
-        // 彻底解决 Swift 6 严格并发报错：使用纯 Async/Await 替代 Timer
         keepAliveTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                // 原生等待 20 秒
                 try? await Task.sleep(nanoseconds: 20_000_000_000)
-                
-                // 检查任务是否被取消，以及 self 是否仍然存活且保持连接
                 guard !Task.isCancelled else { break }
                 guard let self = self, self.isConnected else { break }
-                
                 _ = try? await self.client?.executeCommand("echo -n ''")
             }
         }
