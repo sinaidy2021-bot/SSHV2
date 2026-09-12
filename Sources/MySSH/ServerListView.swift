@@ -11,8 +11,8 @@ struct ServerListView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section(header: Text("服务器信息")) {
-                    TextField("IP 或域名", text: $host)
+                Section(header: Text("服务器配置")) {
+                    TextField("IP 地址或域名", text: $host)
                         .autocapitalization(.none)
                         .keyboardType(.asciiCapable)
                     TextField("端口 (默认 22)", text: $port)
@@ -25,7 +25,7 @@ struct ServerListView: View {
                 Section {
                     Button(action: {
                         let srv = SSHServer(
-                            name: host,
+                            name: host.isEmpty ? "默认服务器" : host,
                             host: host,
                             port: Int(port) ?? 22,
                             username: username,
@@ -41,7 +41,7 @@ struct ServerListView: View {
                     .disabled(host.isEmpty)
                 }
             }
-            .navigationTitle("SSH 管理")
+            .navigationTitle("服务器列表")
             .navigationDestination(isPresented: $showTerminal) {
                 TerminalView(session: session)
             }
