@@ -9,11 +9,12 @@ class SSHSession: ObservableObject {
     @Published var statusMessage: String = "未连接"
     
     private var client: SSHClient?
-    private var keepAliveTimer: Timer?
+    // 抛弃容易引发并发隔离冲突的 Timer，改用原生的并发 Task
+    private var keepAliveTask: Task<Void, Never>?
 
     func connect(server: SSHServer) {
         self.statusMessage = "正在连接 \(server.host)..."
-        Task {
+        Task { @MainActor in
             do {
                 let client = try await SSHClient.connect(
                     host: server.host,
@@ -36,7 +37,7 @@ class SSHSession: ObservableObject {
 
     func disconnect() {
         stopKeepAlive()
-        Task {
+        Task { @MainActor in
             try? await client?.close()
             self.client = nil
             self.isConnected = false
@@ -52,7 +53,7 @@ class SSHSession: ObservableObject {
         let blockIndex = blocks.count
         blocks.append(CommandBlock(command: trimmed, output: "", isRunning: true))
 
-        Task {
+        Task { @MainActor in
             do {
                 let outputStream = try await client.executeCommandStream(trimmed)
                 for try await chunk in outputStream {
@@ -82,17 +83,24 @@ class SSHSession: ObservableObject {
 
     private func startKeepAlive() {
         stopKeepAlive()
-        keepAliveTimer = Timer.scheduledTimer(withTimeInterval: 20.0, repeats: true) { [weak self] _ in
-            // 修复 Swift 并发检查：在 MainActor 上下文中安全地展开弱引用并执行异步任务
-            Task { @MainActor in
-                guard let strongSelf = self, strongSelf.isConnected else { return }
-                _ = try? await strongSelf.client?.executeCommand("echo -n ''")
+        
+        // 彻底解决 Swift 6 严格并发报错：使用纯 Async/Await 替代 Timer
+        keepAliveTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                // 原生等待 20 秒
+                try? await Task.sleep(nanoseconds: 20_000_000_000)
+                
+                // 检查任务是否被取消，以及 self 是否仍然存活且保持连接
+                guard !Task.isCancelled else { break }
+                guard let self = self, self.isConnected else { break }
+                
+                _ = try? await self.client?.executeCommand("echo -n ''")
             }
         }
     }
 
     private func stopKeepAlive() {
-        keepAliveTimer?.invalidate()
-        keepAliveTimer = nil
+        keepAliveTask?.cancel()
+        keepAliveTask = nil
     }
 }
