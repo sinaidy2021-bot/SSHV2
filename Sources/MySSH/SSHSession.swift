@@ -15,11 +15,13 @@ class SSHSession: ObservableObject {
         self.statusMessage = "正在连接 \(server.host)..."
         Task {
             do {
+                // 修复 1：增加 reconnect: .never 参数
                 let client = try await SSHClient.connect(
                     host: server.host,
                     port: server.port,
                     authenticationMethod: .passwordBased(username: server.username, password: server.password),
-                    hostKeyValidator: .acceptAnything()
+                    hostKeyValidator: .acceptAnything(),
+                    reconnect: .never
                 )
                 self.client = client
                 self.isConnected = true
@@ -54,9 +56,16 @@ class SSHSession: ObservableObject {
         Task {
             do {
                 let outputStream = try await client.executeCommandStream(trimmed)
+                // 修复 2：正确解析 ExecCommandOutput 分支数据
                 for try await chunk in outputStream {
-                    let text = String(buffer: chunk)
-                    self.blocks[blockIndex].output += text
+                    switch chunk {
+                    case .stdout(let buffer):
+                        let text = String(buffer: buffer)
+                        self.blocks[blockIndex].output += text
+                    case .stderr(let buffer):
+                        let text = String(buffer: buffer)
+                        self.blocks[blockIndex].output += text
+                    }
                 }
                 self.blocks[blockIndex].isRunning = false
             } catch {
@@ -72,9 +81,10 @@ class SSHSession: ObservableObject {
 
     private func startKeepAlive() {
         stopKeepAlive()
-        keepAliveTimer = Timer.scheduledTimer(withTimeInterval: 20.0, repeats: true) { [weak self] _ in
-            guard let self = self, self.isConnected else { return }
-            Task {
+        // 修复 3：规避 Actor Sendable 警告
+        keepAliveTimer = Timer.scheduledTimer(withTimeInterval: 20.0, repeats: true) { _ in
+            Task { @MainActor [weak self] in
+                guard let self = self, self.isConnected else { return }
                 _ = try? await self.client?.executeCommand("echo -n ''")
             }
         }
