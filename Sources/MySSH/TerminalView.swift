@@ -41,8 +41,7 @@ struct TerminalView: View {
                     .padding(12)
                 }
                 .background(Color(UIColor.systemBackground))
-                // 修复 4：适配 iOS 17 最新的 onChange 语法
-                .onChange(of: session.blocks.count) { oldValue, newValue in
+                .onChange(of: session.blocks.count) { _, _ in
                     if let lastID = session.blocks.last?.id {
                         withAnimation { proxy.scrollTo(lastID, anchor: .bottom) }
                     }
@@ -120,7 +119,7 @@ struct CustomSSHKeyboard: View {
 
     var body: some View {
         VStack(spacing: 5) {
-            // 输入输入预览框
+            // 输入预览框
             HStack {
                 TextField("点击唤起输入或按下方快捷键...", text: $inputText)
                     .focused(isFocused)
