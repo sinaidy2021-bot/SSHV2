@@ -1,61 +1,31 @@
-name: Build IPA
+name: Unzip PhoneProxy
+
 on:
-  workflow_dispatch:
+  workflow_dispatch: # 支持在 GitHub 网页手动一键点击运行
+
 jobs:
-  build:
-    runs-on: macos-15
+  unzip-and-commit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 赋予推送解压后代码到仓库的权限
+
     steps:
-      - uses: actions/checkout@v4
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
 
-      - name: Locate source
+      - name: 解压 PhoneProxy.zip
         run: |
-          set -euo pipefail
-          if [ -f PhoneProxy.zip ]; then
-            mkdir -p "$RUNNER_TEMP/src"
-            unzip -q PhoneProxy.zip -d "$RUNNER_TEMP/src"
-            SRC="$RUNNER_TEMP/src/PhoneProxy"
+          if [ -f "PhoneProxy.zip" ]; then
+            unzip -o PhoneProxy.zip
+            # 解压完成后删除 zip 压缩包（如需保留 zip，请删除下面这行）
+            rm PhoneProxy.zip
           else
-            SRC="$GITHUB_WORKSPACE"
+            echo "未找到 PhoneProxy.zip" && exit 1
           fi
-          echo "SRC=$SRC" >> "$GITHUB_ENV"
-          ls -la "$SRC"
 
-      - uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: latest-stable
-
-      - run: brew install xcodegen
-
-      - name: Generate project
-        working-directory: ${{ env.SRC }}
-        run: xcodegen generate
-
-      - name: Resolve packages
-        working-directory: ${{ env.SRC }}
-        run: xcodebuild -resolvePackageDependencies -project PhoneProxy.xcodeproj -scheme PhoneProxy
-
-      - name: Archive
-        working-directory: ${{ env.SRC }}
+      - name: 提交并推送到仓库
         run: |
-          set -euo pipefail
-          xcodebuild archive \
-            -project PhoneProxy.xcodeproj \
-            -scheme PhoneProxy \
-            -configuration Release \
-            -destination 'generic/platform=iOS' \
-            -archivePath "$PWD/build/PhoneProxy.xcarchive" \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
-
-      - name: Package IPA
-        working-directory: ${{ env.SRC }}
-        run: |
-          set -euo pipefail
-          mkdir -p build/ipa/Payload
-          cp -R build/PhoneProxy.xcarchive/Products/Applications/PhoneProxy.app build/ipa/Payload/
-          (cd build/ipa && zip -qry ../PhoneProxy-unsigned.ipa Payload)
-          ls -lh build/PhoneProxy-unsigned.ipa
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: PhoneProxy-unsigned
-          path: ${{ env.SRC }}/build/PhoneProxy-unsigned.ipa
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: 解压 PhoneProxy 源码文件" && git push)
