@@ -1,139 +1,87 @@
-name: Build PhoneProxy (with UDP & IPA)
-
+name: Build IPA
 on:
   workflow_dispatch:
-
 jobs:
   build:
-    runs-on: macos-14
-    permissions:
-      contents: write
-
+    runs-on: macos-15
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: 注入完整且语法验证的 UDP 转发逻辑
+      - name: Locate source
         run: |
-          # 1. 写入 Socks5UDPSession.swift
-          cat << 'EOF' > PhoneProxy/Core/Socks5UDPSession.swift
-          import Foundation
-          import Network
+          set -euo pipefail
+          zt=0; lt=0
+          if [ -f PhoneProxy.zip ]; then zt=$(git log -1 --format=%ct -- PhoneProxy.zip); fi
+          if [ -f project.yml ]; then lt=$(git log -1 --format=%ct -- project.yml App Core Shared); fi
+          if [ "$zt" -gt "$lt" ]; then
+            echo "使用 PhoneProxy.zip"
+            mkdir -p "$RUNNER_TEMP/src"
+            unzip -q PhoneProxy.zip -d "$RUNNER_TEMP/src"
+            SRC=$(dirname "$(find "$RUNNER_TEMP/src" -name project.yml | head -1)")
+          elif [ -f project.yml ]; then
+            echo "使用仓库根目录的散开文件"
+            SRC="$GITHUB_WORKSPACE"
+          else
+            echo "::error::找不到 PhoneProxy.zip 或 project.yml"; exit 1
+          fi
+          echo "SRC=$SRC" >> "$GITHUB_ENV"
+          ls -la "$SRC"
+          if ! grep -q startUDP "$SRC/Core/Socks5Server.swift"; then
+            echo "::error::这是旧版本（没有 UDP 功能），请重新上传最新的 PhoneProxy.zip"; exit 1
+          fi
 
-          public class Socks5UDPSession {
-              private let tcpConnection: NWConnection
-              private let udpListener: NWListener
-              private let queue: DispatchQueue
-              private var targetOutbounds: [String: NWConnection] = [:]
-              private var clientInbound: NWConnection?
-              private let sessionLock = NSLock()
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
 
-              public init(tcpConnection: NWConnection, udpListener: NWListener, queue: DispatchQueue) {
-                  self.tcpConnection = tcpConnection
-                  self.udpListener = udpListener
-                  self.queue = queue
-              }
+      - run: brew install xcodegen
 
-              public func start() {
-                  udpListener.newConnectionHandler = { [weak self] inbound in
-                      guard let self = self else { return }
-                      self.sessionLock.lock()
-                      self.clientInbound = inbound
-                      self.sessionLock.unlock()
-                      
-                      inbound.start(queue: self.queue)
-                      self.receiveFromClient(inbound)
-                  }
-              }
+      - name: Generate project
+        working-directory: ${{ env.SRC }}
+        run: xcodegen generate
 
-              private func receiveFromClient(_ connection: NWConnection) {
-                  connection.receiveMessage { [weak self] content, _, _, error in
-                      guard let self = self, let data = content, data.count > 10, data[2] == 0x00 else {
-                          if error == nil {
-                              self?.receiveFromClient(connection)
-                          }
-                          return
-                      }
-                      let atyp = data[3]
-                      var offset = 4
-                      var targetHost: NWEndpoint.Host?
+      - name: Resolve packages
+        working-directory: ${{ env.SRC }}
+        run: xcodebuild -resolvePackageDependencies -project PhoneProxy.xcodeproj -scheme PhoneProxy
 
-                      if atyp == 0x01 {
-                          let ipStr = data.subdata(in: offset..<offset+4).map { String($0) }.joined(separator: ".")
-                          targetHost = NWEndpoint.Host(ipStr)
-                          offset += 4
-                      } else if atyp == 0x03 {
-                          let len = Int(data[offset])
-                          offset += 1
-                          if let domain = String(data: data.subdata(in: offset..<offset+len), encoding: .utf8) {
-                              targetHost = NWEndpoint.Host(domain)
-                          }
-                          offset += len
-                      }
+      - name: Archive
+        working-directory: ${{ env.SRC }}
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          xcodebuild archive \
+            -project PhoneProxy.xcodeproj \
+            -scheme PhoneProxy \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$PWD/build/PhoneProxy.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            2>&1 | tee build/xcodebuild.log
 
-                      guard let host = targetHost, data.count >= offset + 2 else {
-                          self.receiveFromClient(connection)
-                          return
-                      }
+      - name: Show errors
+        if: failure()
+        working-directory: ${{ env.SRC }}
+        run: grep -E "error:" build/xcodebuild.log | awk '!seen[$0]++' | head -40 || true
 
-                      let portNum = data.subdata(in: offset..<offset+2).withUnsafeBytes { $0.load(as: UInt16.self).bigEndian }
-                      offset += 2
+      - name: Package IPA
+        working-directory: ${{ env.SRC }}
+        run: |
+          set -euo pipefail
+          mkdir -p build/ipa/Payload
+          cp -R build/PhoneProxy.xcarchive/Products/Applications/PhoneProxy.app build/ipa/Payload/
+          (cd build/ipa && zip -qry ../PhoneProxy-unsigned.ipa Payload)
+          ls -lh build/PhoneProxy-unsigned.ipa
 
-                      let payload = data.subdata(in: offset..<data.count)
-                      let headerPrefix = data.subdata(in: 0..<offset)
-                      let key = "\(host):\(portNum)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhoneProxy-unsigned
+          path: ${{ env.SRC }}/build/PhoneProxy-unsigned.ipa
 
-                      self.sessionLock.lock()
-                      let outbound: NWConnection
-                      if let existing = self.targetOutbounds[key] {
-                          outbound = existing
-                      } else {
-                          outbound = NWConnection(host: host, port: NWEndpoint.Port(rawValue: portNum)!, using: .udp)
-                          self.targetOutbounds[key] = outbound
-                          outbound.start(queue: self.queue)
-                          self.receiveFromTarget(outbound, headerPrefix: headerPrefix)
-                      }
-                      self.sessionLock.unlock()
-
-                      outbound.send(content: payload, completion: .contentProcessed({ _ in }))
-                      self.receiveFromClient(connection)
-                  }
-              }
-
-              private func receiveFromTarget(_ connection: NWConnection, headerPrefix: Data) {
-                  connection.receiveMessage { [weak self] content, _, _, error in
-                      guard let self = self, let replyData = content, error == nil else { return }
-                      var fullReply = headerPrefix
-                      fullReply.append(replyData)
-
-                      self.sessionLock.lock()
-                      let inbound = self.clientInbound
-                      self.sessionLock.unlock()
-
-                      inbound?.send(content: fullReply, completion: .contentProcessed({ _ in }))
-                      self.receiveFromTarget(connection, headerPrefix: headerPrefix)
-                  }
-              }
-
-              public func stop() {
-                  udpListener.cancel()
-                  clientInbound?.cancel()
-                  sessionLock.lock()
-                  for conn in targetOutbounds.values {
-                      conn.cancel()
-                  }
-                  targetOutbounds.removeAll()
-                  sessionLock.unlock()
-              }
-          }
-          EOF
-
-          # 2. 覆盖 Socks5Server.swift（修齐所有方法签名与 NWConnection 状态匹配）
-          cat << 'EOF' > PhoneProxy/Core/Socks5Server.swift
-          import Foundation
-          import Network
-
-          public class Socks5Server {
-              private var tcpListener: NWListener?
-              private let port: NWEndpoint.Port
-              private let queue = DispatchQueue(label: "com.phoneproxy.socks5", qos: .userIniti
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: ${{ env.SRC }}/build/xcodebuild.log
+          if-no-files-found: ignore
