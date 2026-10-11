@@ -1,6 +1,5 @@
 name: Build PhoneProxy (with UDP & IPA)
 
-# 仅保留 workflow_dispatch，彻底禁用 push/PR 自动构建
 on:
   workflow_dispatch:
 
@@ -13,13 +12,6 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
-
-      - name: 切换到 Xcode 16
-        run: |
-          sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer || \
-          sudo xcode-select -s /Applications/Xcode_16.0.app/Contents/Developer || \
-          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-          xcodebuild -version
 
       - name: 注入 UDP 转发核心代码
         run: |
@@ -304,11 +296,16 @@ jobs:
           }
           EOF
 
-      - name: 安装并运行 XcodeGen
+      - name: 安装并运行 XcodeGen 生成通用工程文件
         run: |
           brew install xcodegen
           cd PhoneProxy
-          xcodegen generate
+          # 强制指定兼容版本为 Xcode 15 格式 (56/60)，彻底避免 format 77 冲突
+          xcodegen generate --project-version Xcode15 || xcodegen generate
+
+          # 降级修正 project.pbxproj 的 objectVersion，确保 xcodebuild 100% 能够读取
+          sed -i '' 's/objectVersion = 77;/objectVersion = 56;/g' PhoneProxy.xcodeproj/project.pbxproj || true
+          sed -i '' 's/compatibilityVersion = "Xcode 16.0";/compatibilityVersion = "Xcode 14.0";/g' PhoneProxy.xcodeproj/project.pbxproj || true
 
       - name: 编译并归档真机 IPA
         run: |
