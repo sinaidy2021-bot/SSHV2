@@ -1,0 +1,42 @@
+name: PhoneProxy
+options:
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+packages:
+  CSSH:
+    url: https://github.com/DimaRU/Libssh2Prebuild
+    branch: master
+
+targets:
+  PhoneProxy:
+    type: application
+    platform: iOS
+    sources:
+      - App
+      - Core
+      - Shared
+    settings:
+      base:
+        # 重签时可改成任意 Bundle ID，本版本不依赖它
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.phoneproxy
+        TARGETED_DEVICE_FAMILY: "1"
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: PhoneProxy
+        UILaunchScreen: {}
+        UIBackgroundModes:
+          - audio
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    dependencies:
+      - package: CSSH
+      - sdk: libz.tbd
