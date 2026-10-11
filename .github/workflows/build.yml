@@ -11,9 +11,8 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 清理残留文件并还原纯净源码
+      - name: 清理并还原纯净源码
         run: |
-          # 删除之前注入产生冲突的额外文件
           rm -f PhoneProxy/Core/Socks5UDPSession.swift
           git checkout -- PhoneProxy/ 2>/dev/null || true
 
@@ -26,34 +25,36 @@ jobs:
           sed -i '' 's/objectVersion = 77;/objectVersion = 56;/g' PhoneProxy.xcodeproj/project.pbxproj 2>/dev/null || true
           sed -i '' 's/compatibilityVersion = "Xcode 16.0";/compatibilityVersion = "Xcode 14.0";/g' PhoneProxy.xcodeproj/project.pbxproj 2>/dev/null || true
 
-      - name: 编译并打包 IPA
+      - name: 编译真机二进制并完整打包 IPA
         run: |
           cd PhoneProxy
 
-          # 编译原生代码，输出具体编译日志
-          set -o pipefail
-          xcodebuild build \
+          # 采用 Ad-hoc 本地伪签名 (-)，强制输出完整的 Mach-O 二进制文件
+          xcodebuild clean build \
             -project PhoneProxy.xcodeproj \
             -scheme PhoneProxy \
             -configuration Release \
             -sdk iphoneos \
             -destination "generic/platform=iOS" \
-            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_ALLOWED=YES \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            SYMROOT="$(pwd)/build" 2>&1 | tee build.log | grep -E "(error:|fatal error:|BUILD FAILED|\*\* BUILD)" || true
+            CODE_SIGN_IDENTITY="-" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            SYMROOT="$(pwd)/build"
 
-          # 检查是否成功产出 .app
-          APP_PATH=$(find build -name "*.app" -type d | head -n 1)
+          # 验证二进制是否存在
+          APP_PATH=$(find build/Release-iphoneos -name "*.app" -type d | head -n 1)
           if [ -z "$APP_PATH" ]; then
-            echo "========== 编译失败，以下为错误日志详情 =========="
-            grep -C 3 "error:" build.log || tail -n 50 build.log
+            echo "::error::未找到构建的 .app 目录"
             exit 1
           fi
 
-          echo "打包 IPA，路径: $APP_PATH"
+          echo "检查构建出的可执行文件："
+          ls -lh "$APP_PATH"
+
+          # 打包真实完整的 Payload
           mkdir -p Payload
-          cp -r "$APP_PATH" Payload/
+          cp -R "$APP_PATH" Payload/
           zip -r -q PhoneProxy.ipa Payload/
           mv PhoneProxy.ipa ../
 
