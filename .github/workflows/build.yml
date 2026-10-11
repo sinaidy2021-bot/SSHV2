@@ -1,34 +1,336 @@
-name: Build PhoneProxy
+name: Build PhoneProxy (with UDP & IPA)
 
+# 仅保留 workflow_dispatch，彻底禁用 push/PR 自动构建
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-  workflow_dispatch: # 支持网页手动点击运行
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-14 # 使用 macOS Runner 编译 iOS/macOS 目标
+    runs-on: macos-14
+    permissions:
+      contents: write
 
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装 XcodeGen
-        run: brew install xcodegen
-
-      - name: 生成 Xcode 项目工程
-        working-directory: PhoneProxy
-        run: xcodegen generate
-
-      - name: 构建 iOS App (模拟器无证书编译)
-        working-directory: PhoneProxy
+      - name: 切换到 Xcode 16
         run: |
-          xcodebuild build \
+          sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer || \
+          sudo xcode-select -s /Applications/Xcode_16.0.app/Contents/Developer || \
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+
+      - name: 注入 UDP 转发核心代码
+        run: |
+          # 1. 替换 Socks5Server.swift 支持 UDP ASSOCIATE (0x03)
+          cat << 'EOF' > PhoneProxy/Core/Socks5Server.swift
+          import Foundation
+          import Network
+
+          public class Socks5Server {
+              private var tcpListener: NWListener?
+              private let port: NWEndpoint.Port
+              private let queue = DispatchQueue(label: "com.phoneproxy.socks5", qos: .userInitiated, attributes: .concurrent)
+              private var udpSessions: [ObjectIdentifier: Socks5UDPSession] = [:]
+              private let lock = NSLock()
+              
+              public init(port: UInt16) {
+                  self.port = NWEndpoint.Port(rawValue: port)!
+              }
+              
+              public func start() throws {
+                  let params = NWParameters.tcp
+                  params.allowLocalEndpointReuse = true
+                  tcpListener = try NWListener(using: params, on: port)
+                  tcpListener?.newConnectionHandler = { [weak self] connection in
+                      self?.handleNewConnection(connection)
+                  }
+                  tcpListener?.start(queue: queue)
+              }
+              
+              public func stop() {
+                  tcpListener?.cancel()
+                  tcpListener = nil
+                  lock.lock()
+                  for session in udpSessions.values { session.stop() }
+                  udpSessions.removeAll()
+                  lock.unlock()
+              }
+              
+              private func handleNewConnection(_ connection: NWConnection) {
+                  connection.start(queue: queue)
+                  handleHandshake(connection)
+              }
+              
+              private func handleHandshake(_ connection: NWConnection) {
+                  connection.receive(minimumIncompleteLength: 2, maximumLength: 257) { [weak self] data, _, _, error in
+                      guard let self = self, let data = data, error == nil, data.count >= 2, data[0] == 0x05 else {
+                          connection.cancel()
+                          return
+                      }
+                      connection.send(content: Data([0x05, 0x00]), completion: .contentProcessed { [weak self] sendError in
+                          if sendError == nil { self?.handleRequest(connection) } else { connection.cancel() }
+                      })
+                  }
+              }
+              
+              private func handleRequest(_ connection: NWConnection) {
+                  connection.receive(minimumIncompleteLength: 4, maximumLength: 1024) { [weak self] data, _, _, error in
+                      guard let self = self, let data = data, error == nil, data.count >= 4 else {
+                          connection.cancel()
+                          return
+                      }
+                      let cmd = data[1]
+                      if cmd == 0x01 {
+                          self?.handleConnect(connection: connection, requestData: data)
+                      } else if cmd == 0x03 {
+                          self?.handleUDPAssociate(connection: connection, requestData: data)
+                      } else {
+                          self?.sendReply(connection: connection, rep: 0x07)
+                      }
+                  }
+              }
+              
+              private func handleConnect(connection: NWConnection, requestData: Data) {
+                  guard let (host, port) = parseAddress(from: requestData) else {
+                      sendReply(connection: connection, rep: 0x08)
+                      return
+                  }
+                  let outbound = NWConnection(host: host, port: port, using: .tcp)
+                  outbound.stateUpdateHandler = { [weak self, weak connection] state in
+                      guard let self = self, let client = connection else { return }
+                      if case .ready = state {
+                          self.sendReply(connection: client, rep: 0x00)
+                          self.pipeConnections(client, outbound)
+                      } else if case .failed = state {
+                          self.sendReply(connection: client, rep: 0x05)
+                      }
+                  }
+                  outbound.start(queue: queue)
+              }
+              
+              private func handleUDPAssociate(connection: NWConnection, requestData: Data) {
+                  do {
+                      let udpParams = NWParameters.udp
+                      udpParams.allowLocalEndpointReuse = true
+                      let udpListener = try NWListener(using: udpParams, on: .any)
+                      let session = Socks5UDPSession(tcpConnection: connection, udpListener: udpListener, queue: queue)
+                      let sessionKey = ObjectIdentifier(connection)
+                      
+                      lock.lock()
+                      udpSessions[sessionKey] = session
+                      lock.unlock()
+                      
+                      udpListener.stateUpdateHandler = { [weak self, weak connection] state in
+                          guard let self = self, let client = connection else { return }
+                          if case .ready = state, let port = udpListener.port?.rawValue {
+                              self.sendUDPAssociateReply(connection: client, boundPort: port)
+                              session.start()
+                          }
+                      }
+                      connection.stateUpdateHandler = { [weak self, weak connection] state in
+                          guard let self = self, let client = connection else { return }
+                          if state == .cancelled || state == .failed(nil) {
+                              self.lock.lock()
+                              let removed = self.udpSessions.removeValue(forKey: ObjectIdentifier(client))
+                              self.lock.unlock()
+                              removed?.stop()
+                          }
+                      }
+                      udpListener.start(queue: queue)
+                  } catch {
+                      sendReply(connection: connection, rep: 0x01)
+                  }
+              }
+              
+              private func sendUDPAssociateReply(connection: NWConnection, boundPort: UInt16) {
+                  var reply = Data([0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1])
+                  var portBigEndian = boundPort.bigEndian
+                  reply.append(Data(bytes: &portBigEndian, count: 2))
+                  connection.send(content: reply, completion: .contentProcessed { _ in })
+              }
+              
+              private func sendReply(connection: NWConnection, rep: UInt8) {
+                  let reply = Data([0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                  connection.send(content: reply, completion: .contentProcessed { _ in })
+              }
+              
+              private func parseAddress(from data: Data) -> (NWEndpoint.Host, NWEndpoint.Port)? {
+                  guard data.count >= 4 else { return nil }
+                  let atyp = data[3]
+                  var offset = 4
+                  var host: NWEndpoint.Host?
+                  if atyp == 0x01 {
+                      guard data.count >= offset + 6 else { return nil }
+                      let ip = data.subdata(in: offset..<offset+4).map { String($0) }.joined(separator: ".")
+                      host = NWEndpoint.Host(ip)
+                      offset += 4
+                  } else if atyp == 0x03 {
+                      let len = Int(data[offset])
+                      offset += 1
+                      guard data.count >= offset + len + 2 else { return nil }
+                      if let domain = String(data: data.subdata(in: offset..<offset+len), encoding: .utf8) {
+                          host = NWEndpoint.Host(domain)
+                      }
+                      offset += len
+                  }
+                  guard let validHost = host, data.count >= offset + 2 else { return nil }
+                  let portNum = data.subdata(in: offset..<offset+2).withUnsafeBytes { $0.load(as: UInt16.self).bigEndian }
+                  guard let validPort = NWEndpoint.Port(rawValue: portNum) else { return nil }
+                  return (validHost, validPort)
+              }
+              
+              private func pipeConnections(_ a: NWConnection, _ b: NWConnection) {
+                  forwardStream(from: a, to: b)
+                  forwardStream(from: b, to: a)
+              }
+              
+              private func forwardStream(from source: NWConnection, to destination: NWConnection) {
+                  source.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] content, _, isComplete, error in
+                      if let data = content, !data.isEmpty {
+                          destination.send(content: data, completion: .contentProcessed { sendError in
+                              if sendError == nil { self?.forwardStream(from: source, to: destination) }
+                          })
+                      }
+                      if isComplete || error != nil {
+                          source.cancel()
+                          destination.cancel()
+                      }
+                  }
+              }
+          }
+          EOF
+
+          # 2. 新增 Socks5UDPSession.swift
+          cat << 'EOF' > PhoneProxy/Core/Socks5UDPSession.swift
+          import Foundation
+          import Network
+
+          public class Socks5UDPSession {
+              private let tcpConnection: NWConnection
+              private let udpListener: NWListener
+              private let queue: DispatchQueue
+              private var targetOutbounds: [String: NWConnection] = [:]
+              private var clientInbound: NWConnection?
+              private let sessionLock = NSLock()
+
+              public init(tcpConnection: NWConnection, udpListener: NWListener, queue: DispatchQueue) {
+                  self.tcpConnection = tcpConnection
+                  self.udpListener = udpListener
+                  self.queue = queue
+              }
+
+              public func start() {
+                  udpListener.newConnectionHandler = { [weak self] inbound in
+                      guard let self = self else { return }
+                      self.sessionLock.lock()
+                      self.clientInbound = inbound
+                      self.sessionLock.unlock()
+                      inbound.start(queue: self.queue)
+                      self.receiveFromClient(inbound)
+                  }
+              }
+
+              private func receiveFromClient(_ connection: NWConnection) {
+                  connection.receiveMessage { [weak self] content, _, _, error in
+                      guard let self = self, let data = content, data.count > 10, data[2] == 0x00 else {
+                          self?.receiveFromClient(connection)
+                          return
+                      }
+                      let atyp = data[3]
+                      var offset = 4
+                      var targetHost: NWEndpoint.Host?
+                      if atyp == 0x01 {
+                          let ipStr = data.subdata(in: offset..<offset+4).map { String($0) }.joined(separator: ".")
+                          targetHost = NWEndpoint.Host(ipStr)
+                          offset += 4
+                      } else if atyp == 0x03 {
+                          let length = Int(data[offset])
+                          offset += 1
+                          if let domain = String(data: data.subdata(in: offset..<offset+length), encoding: .utf8) {
+                              targetHost = NWEndpoint.Host(domain)
+                          }
+                          offset += length
+                      }
+                      guard let host = targetHost, data.count >= offset + 2 else {
+                          self.receiveFromClient(connection)
+                          return
+                      }
+                      let portNum = data.subdata(in: offset..<offset+2).withUnsafeBytes { $0.load(as: UInt16.self).bigEndian }
+                      offset += 2
+                      let payload = data.subdata(in: offset..<data.count)
+                      let headerPrefix = data.subdata(in: 0..<offset)
+                      let key = "\(host):\(portNum)"
+
+                      self.sessionLock.lock()
+                      let outbound: NWConnection
+                      if let existing = self.targetOutbounds[key] {
+                          outbound = existing
+                      } else {
+                          outbound = NWConnection(host: host, port: NWEndpoint.Port(rawValue: portNum)!, using: .udp)
+                          self.targetOutbounds[key] = outbound
+                          outbound.start(queue: self.queue)
+                          self.receiveFromTarget(outbound, headerPrefix: headerPrefix)
+                      }
+                      self.sessionLock.unlock()
+
+                      outbound.send(content: payload, completion: .contentProcessed({ _ in }))
+                      self.receiveFromClient(connection)
+                  }
+              }
+
+              private func receiveFromTarget(_ connection: NWConnection, headerPrefix: Data) {
+                  connection.receiveMessage { [weak self] content, _, _, error in
+                      guard let self = self, let replyData = content, error == nil else { return }
+                      var fullReply = headerPrefix
+                      fullReply.append(replyData)
+                      self.sessionLock.lock()
+                      let inbound = self.clientInbound
+                      self.sessionLock.unlock()
+                      inbound?.send(content: fullReply, completion: .contentProcessed({ _ in }))
+                      self.receiveFromTarget(connection, headerPrefix: headerPrefix)
+                  }
+              }
+
+              public func stop() {
+                  udpListener.cancel()
+                  clientInbound?.cancel()
+                  sessionLock.lock()
+                  for conn in targetOutbounds.values { conn.cancel() }
+                  targetOutbounds.removeAll()
+                  sessionLock.unlock()
+              }
+          }
+          EOF
+
+      - name: 安装并运行 XcodeGen
+        run: |
+          brew install xcodegen
+          cd PhoneProxy
+          xcodegen generate
+
+      - name: 编译并归档真机 IPA
+        run: |
+          cd PhoneProxy
+          xcodebuild archive \
             -project PhoneProxy.xcodeproj \
             -scheme PhoneProxy \
-            -destination "generic/platform=iOS Simulator" \
+            -destination "generic/platform=iOS" \
+            -archivePath build/PhoneProxy.xcarchive \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY=""
+
+          mkdir -p build/Payload
+          cp -r build/PhoneProxy.xcarchive/Products/Applications/PhoneProxy.app build/Payload/
+          cd build
+          zip -r PhoneProxy.ipa Payload
+          cd ../..
+          mv PhoneProxy/build/PhoneProxy.ipa ./
+
+      - name: 上传构建产物 (IPA)
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhoneProxy-with-UDP
+          path: PhoneProxy.ipa
